@@ -82,11 +82,16 @@ static const char *const var_names[] = {
     "prev_selected_n",   ///< number of the last selected frame
 
     "key",               ///< tell if the frame is a key frame
+#if FF_API_FRAME_PKT
     "pos",               ///< original position in the file of the frame
+#endif
 
     "scene",
 
     "concatdec_select",  ///< frame is within the interval set by the concat demuxer
+
+    "ih",                ///< ih: Represents the height of the input video frame.
+    "iw",                ///< iw: Represents the width of the input video frame.
 
     NULL
 };
@@ -141,6 +146,9 @@ enum var_name {
     VAR_SCENE,
 
     VAR_CONCATDEC_SELECT,
+
+    VAR_IH,
+    VAR_IW,
 
     VAR_VARS_NB
 };
@@ -231,6 +239,7 @@ static int config_input(AVFilterLink *inlink)
 
     select->var_values[VAR_TB] = av_q2d(inlink->time_base);
 
+    select->var_values[VAR_PREV_SELECTED_N]   = NAN;
     select->var_values[VAR_PREV_PTS]          = NAN;
     select->var_values[VAR_PREV_SELECTED_PTS] = NAN;
     select->var_values[VAR_PREV_SELECTED_T]   = NAN;
@@ -260,6 +269,9 @@ static int config_input(AVFilterLink *inlink)
     select->var_values[VAR_SCENE]             = NAN;
     select->var_values[VAR_CONSUMED_SAMPLES_N] = NAN;
     select->var_values[VAR_SAMPLES_N]          = NAN;
+
+    select->var_values[VAR_IH] = NAN;
+    select->var_values[VAR_IW] = NAN;
 
     select->var_values[VAR_SAMPLE_RATE] =
         inlink->type == AVMEDIA_TYPE_AUDIO ? inlink->sample_rate : NAN;
@@ -294,7 +306,6 @@ static double get_scene_score(AVFilterContext *ctx, AVFrame *frame)
             count += select->width[plane] * select->height[plane];
         }
 
-        emms_c();
         mafd = (double)sad / count / (1ULL << (select->bitdepth - 8));
         diff = fabs(mafd - select->prev_mafd);
         ret  = av_clipf(FFMIN(mafd, diff) / 100., 0, 1);
@@ -355,6 +366,9 @@ FF_ENABLE_DEPRECATION_WARNINGS
         break;
 
     case AVMEDIA_TYPE_VIDEO:
+        select->var_values[VAR_IH] = frame->height;
+        select->var_values[VAR_IW] = frame->width;
+
         select->var_values[VAR_INTERLACE_TYPE] =
             !(frame->flags & AV_FRAME_FLAG_INTERLACED) ? INTERLACE_TYPE_P :
         (frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? INTERLACE_TYPE_T : INTERLACE_TYPE_B;

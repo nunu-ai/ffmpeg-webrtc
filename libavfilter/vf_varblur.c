@@ -19,10 +19,10 @@
  */
 
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
 #include "framesync.h"
 #include "internal.h"
 #include "video.h"
@@ -46,7 +46,7 @@ typedef struct VarBlurContext {
     void (*compute_sat)(const uint8_t *ssrc,
                         int linesize,
                         int w, int h,
-                        const uint8_t *dstp,
+                        uint8_t *dstp,
                         int dst_linesize);
 
     int (*blur_plane)(AVFilterContext *ctx,
@@ -99,7 +99,7 @@ static const enum AVPixelFormat pix_fmts[] = {
 static void compute_sat##depth(const uint8_t *ssrc,  \
                                int linesize,         \
                                int w, int h,         \
-                               const uint8_t *dstp,  \
+                               uint8_t *dstp,        \
                                int dst_linesize)     \
 {                                                    \
     const type *src = (const type *)ssrc;            \

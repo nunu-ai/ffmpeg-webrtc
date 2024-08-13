@@ -40,6 +40,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/timecode.h"
 #include "dv.h"
 #include "libavutil/avassert.h"
@@ -358,7 +359,6 @@ static int dv_init_demux(AVFormatContext *s, DVDemuxContext *c)
     c->fctx                   = s;
     c->vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     c->vst->codecpar->codec_id   = AV_CODEC_ID_DVVIDEO;
-    c->vst->codecpar->bit_rate   = 25000000;
     c->vst->start_time        = 0;
 
     avpriv_set_pts_info(c->vst, 64, 1, DV_TIMESCALE_VIDEO);
@@ -711,15 +711,15 @@ static int dv_probe(const AVProbeData *p)
     return 0;
 }
 
-const AVInputFormat ff_dv_demuxer = {
-    .name           = "dv",
-    .long_name      = NULL_IF_CONFIG_SMALL("DV (Digital Video)"),
+const FFInputFormat ff_dv_demuxer = {
+    .p.name         = "dv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("DV (Digital Video)"),
+    .p.extensions   = "dv,dif",
     .priv_data_size = sizeof(RawDVContext),
     .read_probe     = dv_probe,
     .read_header    = dv_read_header,
     .read_packet    = dv_read_packet,
     .read_seek      = dv_read_seek,
-    .extensions     = "dv,dif",
 };
 
 #else // CONFIG_DV_DEMUXER

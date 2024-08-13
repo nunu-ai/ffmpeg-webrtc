@@ -19,18 +19,25 @@
 #ifndef AVCODEC_VULKAN_DECODE_H
 #define AVCODEC_VULKAN_DECODE_H
 
+#include "codec_id.h"
 #include "decode.h"
-#include "hwconfig.h"
+#include "hwaccel_internal.h"
 #include "internal.h"
 
 #include "vulkan_video.h"
 
+typedef struct FFVulkanDecodeDescriptor {
+    enum AVCodecID                   codec_id;
+    FFVulkanExtensions               decode_extension;
+    VkVideoCodecOperationFlagBitsKHR decode_op;
+
+    VkExtensionProperties ext_props;
+} FFVulkanDecodeDescriptor;
+
 typedef struct FFVulkanDecodeProfileData {
-    VkVideoCapabilitiesKHR caps;
-    VkVideoDecodeCapabilitiesKHR dec_caps;
     VkVideoDecodeH264ProfileInfoKHR h264_profile;
-    VkVideoDecodeH264ProfileInfoKHR h265_profile;
-    VkVideoDecodeAV1ProfileInfoMESA av1_profile;
+    VkVideoDecodeH265ProfileInfoKHR h265_profile;
+    VkVideoDecodeAV1ProfileInfoKHR av1_profile;
     VkVideoDecodeUsageInfoKHR usage;
     VkVideoProfileInfoKHR profile;
     VkVideoProfileListInfoKHR profile_list;
@@ -39,8 +46,12 @@ typedef struct FFVulkanDecodeProfileData {
 typedef struct FFVulkanDecodeShared {
     FFVulkanContext s;
     FFVkVideoCommon common;
-    FFVkExecPool exec_pool;
-    FFVulkanDecodeProfileData profile_data;
+    FFVkQueueFamilyCtx qf;
+
+    AVBufferPool *buf_pool;
+
+    VkVideoCapabilitiesKHR caps;
+    VkVideoDecodeCapabilitiesKHR dec_caps;
 
     AVBufferRef *dpb_hwfc_ref;  /* Only used for dedicated_dpb */
 
@@ -54,18 +65,25 @@ typedef struct FFVulkanDecodeShared {
 } FFVulkanDecodeShared;
 
 typedef struct FFVulkanDecodeContext {
-    AVBufferRef *shared_ref;
+    FFVulkanDecodeShared *shared_ctx;
     AVBufferRef *session_params;
+    FFVkExecPool exec_pool;
 
     int dedicated_dpb; /* Oddity  #1 - separate DPB images */
     int layered_dpb;   /* Madness #1 - layered  DPB images */
     int external_fg;   /* Oddity  #2 - hardware can't apply film grain */
     uint32_t frame_id_alloc_mask; /* For AV1 only */
 
+    /* Workaround for NVIDIA drivers tested with CTS version 1.3.8 for AV1.
+     * The tests were incorrect as the OrderHints were offset by 1. */
+    int quirk_av1_offset;
+
     /* Thread-local state below */
-    AVBufferPool *tmp_pool; /* Pool for temporary data, if needed (HEVC) */
-    size_t tmp_pool_ele_size;
-    int params_changed;
+    struct HEVCHeaderSet *hevc_headers;
+    size_t hevc_headers_size;
+
+    uint32_t                       *slice_off;
+    unsigned int                    slice_off_max;
 } FFVulkanDecodeContext;
 
 typedef struct FFVulkanDecodePicture {
@@ -80,10 +98,6 @@ typedef struct FFVulkanDecodePicture {
     VkSemaphore                     sem;
     uint64_t                        sem_value;
 
-    /* State */
-    int                             update_params;
-    AVBufferRef                    *session_params;
-
     /* Current picture */
     VkVideoPictureResourceInfoKHR   ref;
     VkVideoReferenceSlotInfoKHR     ref_slot;
@@ -93,15 +107,15 @@ typedef struct FFVulkanDecodePicture {
     VkVideoReferenceSlotInfoKHR     ref_slots[36];
 
     /* Main decoding struct */
-    AVBufferRef                    *params_buf;
     VkVideoDecodeInfoKHR            decode_info;
 
     /* Slice data */
     AVBufferRef                    *slices_buf;
     size_t                          slices_size;
-    uint32_t                       *slice_off;
-    unsigned int                    slice_off_max;
-    uint32_t                        nb_slices;
+
+    /* Vulkan functions needed for destruction, as no other context is guaranteed to exist */
+    PFN_vkWaitSemaphores            wait_semaphores;
+    PFN_vkDestroyImageView          destroy_image_view;
 } FFVulkanDecodePicture;
 
 /**
@@ -124,9 +138,9 @@ int ff_vk_update_thread_context(AVCodecContext *dst, const AVCodecContext *src);
 int ff_vk_frame_params(AVCodecContext *avctx, AVBufferRef *hw_frames_ctx);
 
 /**
- * Sets FFVulkanDecodeContext.params_changed to 1.
+ * Removes current session parameters to recreate them
  */
-int ff_vk_params_changed(AVCodecContext *avctx, int t, const uint8_t *b, uint32_t s);
+int ff_vk_params_invalidate(AVCodecContext *avctx, int t, const uint8_t *b, uint32_t s);
 
 /**
  * Prepare a frame, creates the image view, and sets up the dpb fields.
@@ -161,9 +175,10 @@ int ff_vk_get_decode_buffer(FFVulkanDecodeContext *ctx, AVBufferRef **buf,
                             void *create_pNext, size_t size);
 
 /**
- * Free VkVideoSessionParametersKHR.
+ * Create VkVideoSessionParametersKHR wrapped in an AVBufferRef.
  */
-void ff_vk_decode_free_params(void *opaque, uint8_t *data);
+int ff_vk_decode_create_params(AVBufferRef **par_ref, void *logctx, FFVulkanDecodeShared *ctx,
+                               const VkVideoSessionParametersCreateInfoKHR *session_params_create);
 
 /**
  * Flush decoder.

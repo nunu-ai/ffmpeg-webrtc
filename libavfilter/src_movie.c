@@ -28,16 +28,14 @@
 
 #include "config_components.h"
 
-#include <float.h>
 #include <stdint.h>
 
 #include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
-#include "libavutil/timestamp.h"
 
 #include "libavcodec/avcodec.h"
 
@@ -51,6 +49,7 @@
 #include "video.h"
 
 typedef struct MovieStream {
+    AVFilterLink *link;
     AVStream *st;
     AVCodecContext *codec_ctx;
     int64_t discontinuity_threshold;
@@ -162,7 +161,8 @@ static AVStream *find_stream(void *log, AVFormatContext *avf, const char *spec)
 static int get_buffer(AVCodecContext *avctx, AVFrame *frame, int flags)
 {
     int linesize_align[AV_NUM_DATA_POINTERS];
-    AVFilterLink *outlink = frame->opaque;
+    MovieStream *st = avctx->opaque;
+    AVFilterLink *outlink = st->link;
     int w, h, ow, oh, copy = 0;
     AVFrame *new;
 
@@ -202,7 +202,6 @@ static int get_buffer(AVCodecContext *avctx, AVFrame *frame, int flags)
     av_frame_move_ref(frame, new);
     av_frame_free(&new);
 
-    frame->opaque = outlink;
     frame->width  = ow;
     frame->height = oh;
 
@@ -224,7 +223,7 @@ static int open_stream(AVFilterContext *ctx, MovieStream *st, int dec_threads)
     if (!st->codec_ctx)
         return AVERROR(ENOMEM);
 
-    st->codec_ctx->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+    st->codec_ctx->opaque = st;
     st->codec_ctx->get_buffer2 = get_buffer;
     ret = avcodec_parameters_to_context(st->codec_ctx, st->st->codecpar);
     if (ret < 0)
@@ -469,6 +468,8 @@ static int movie_config_output_props(AVFilterLink *outlink)
         break;
     }
 
+    st->link = outlink;
+
     return 0;
 }
 
@@ -581,7 +582,6 @@ static int activate(AVFilterContext *ctx)
                              movie->out_index[movie->pkt->stream_index];
 
             if (pkt_out_id >= 0) {
-                movie->pkt->opaque = ctx->outputs[pkt_out_id];
                 ret = decode_packet(ctx, pkt_out_id);
             }
             av_packet_unref(movie->pkt);

@@ -58,6 +58,7 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/lfg.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "roqvideo.h"
 #include "bytestream.h"
@@ -911,10 +912,10 @@ static int roq_encode_video(RoqEncContext *enc)
     /* Quake 3 can't handle chunks bigger than 65535 bytes */
     if (tempData->mainChunkSize/8 > 65535 && enc->quake3_compat) {
         if (enc->lambda > 100000) {
-            av_log(roq->avctx, AV_LOG_ERROR, "Cannot encode video in Quake compatible form\n");
+            av_log(roq->logctx, AV_LOG_ERROR, "Cannot encode video in Quake compatible form\n");
             return AVERROR(EINVAL);
         }
-        av_log(roq->avctx, AV_LOG_ERROR,
+        av_log(roq->logctx, AV_LOG_ERROR,
                "Warning, generated a frame too big for Quake (%d > 65535), "
                "now switching to a bigger qscale value.\n",
                tempData->mainChunkSize/8);
@@ -972,7 +973,7 @@ static av_cold int roq_encode_init(AVCodecContext *avctx)
 
     av_lfg_init(&enc->randctx, 1);
 
-    roq->avctx = avctx;
+    roq->logctx = avctx;
 
     enc->framesSinceKeyframe = 0;
     if ((avctx->width & 0xf) || (avctx->height & 0xf)) {
@@ -1056,8 +1057,6 @@ static int roq_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     RoqEncContext *const enc = avctx->priv_data;
     RoqContext    *const roq = &enc->common;
     int size, ret;
-
-    roq->avctx = avctx;
 
     enc->frame_to_enc = frame;
 

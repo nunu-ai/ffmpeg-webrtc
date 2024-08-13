@@ -19,18 +19,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavcodec/get_bits.h"
 #include "libavcodec/golomb.h"
 #include "libavcodec/evc.h"
-#include "avformat.h"
 #include "avio.h"
 #include "evc.h"
-#include "avio_internal.h"
-
-// The length field that indicates the length in bytes of the following NAL unit is configured to be of 4 bytes
-#define EVC_NALU_LENGTH_PREFIX_SIZE        (4)  /* byte */
-#define EVC_NALU_HEADER_SIZE               (2)  /* byte */
 
 // @see ISO/IEC 14496-15:2021 Coding of audio-visual objects - Part 15: section 12.3.3.1
 enum {
@@ -40,35 +34,6 @@ enum {
     SEI_INDEX,
     NB_ARRAYS
 };
-
-// The sturcture reflects SPS RBSP(raw byte sequence payload) layout
-// @see ISO_IEC_23094-1 section 7.3.2.1
-//
-// The following descriptors specify the parsing process of each element
-// u(n) - unsigned integer using n bits
-// ue(v) - unsigned integer 0-th order Exp_Golomb-coded syntax element with the left bit first
-typedef struct EVCSPS {
-    int sps_seq_parameter_set_id;   // ue(v)
-    int profile_idc;                // u(8)
-    int level_idc;                  // u(8)
-    int toolset_idc_h;              // u(32)
-    int toolset_idc_l;              // u(32)
-    int chroma_format_idc;          // ue(v)
-    int pic_width_in_luma_samples;  // ue(v)
-    int pic_height_in_luma_samples; // ue(v)
-    int bit_depth_luma_minus8;      // ue(v)
-    int bit_depth_chroma_minus8;    // ue(v)
-
-    // @note
-    // Currently the structure does not reflect the entire SPS RBSP layout.
-    // It contains only the fields that are necessary to read from the NAL unit all the values
-    // necessary for the correct initialization of EVCDecoderConfigurationRecord
-
-    // @note
-    // If necessary, add the missing fields to the structure to reflect
-    // the contents of the entire NAL unit of the SPS type
-
-} EVCSPS;
 
 // @see ISO/IEC 14496-15:2021 Coding of audio-visual objects - Part 15: section 12.3.3.3
 typedef struct EVCNALUnitArray {
@@ -95,7 +60,6 @@ typedef struct EVCDecoderConfigurationRecord {
     uint8_t  bit_depth_chroma_minus8;       // 3 bits
     uint16_t pic_width_in_luma_samples;     // 16 bits
     uint16_t pic_height_in_luma_samples;    // 16 bits
-    uint8_t  reserved;                      // 6 bits '000000'b
     uint8_t  lengthSizeMinusOne;            // 2 bits
     uint8_t  num_of_arrays;                 // 8 bits
     EVCNALUnitArray arrays[NB_ARRAYS];
@@ -116,49 +80,46 @@ typedef struct NALUList {
 static int evcc_parse_sps(const uint8_t *bs, int bs_size, EVCDecoderConfigurationRecord *evcc)
 {
     GetBitContext gb;
-    EVCSPS sps;
+    unsigned sps_seq_parameter_set_id;
+    int ret;
 
     bs += EVC_NALU_HEADER_SIZE;
     bs_size -= EVC_NALU_HEADER_SIZE;
 
-    if (init_get_bits8(&gb, bs, bs_size) < 0)
-        return 0;
+    ret = init_get_bits8(&gb, bs, bs_size);
+    if (ret < 0)
+        return ret;
 
-    sps.sps_seq_parameter_set_id = get_ue_golomb_long(&gb);
+    sps_seq_parameter_set_id = get_ue_golomb_long(&gb);
 
-    if (sps.sps_seq_parameter_set_id >= EVC_MAX_SPS_COUNT)
-        return 0;
+    if (sps_seq_parameter_set_id >= EVC_MAX_SPS_COUNT)
+        return AVERROR_INVALIDDATA;
 
     // the Baseline profile is indicated by profile_idc eqal to 0
     // the Main profile is indicated by profile_idc eqal to 1
-    sps.profile_idc = get_bits(&gb, 8);
+    evcc->profile_idc = get_bits(&gb, 8);
 
-    sps.level_idc = get_bits(&gb, 8);
+    evcc->level_idc = get_bits(&gb, 8);
 
-    sps.toolset_idc_h = get_bits_long(&gb, 32);
-    sps.toolset_idc_l = get_bits_long(&gb, 32);
+    evcc->toolset_idc_h = get_bits_long(&gb, 32);
+    evcc->toolset_idc_l = get_bits_long(&gb, 32);
 
     // 0 - monochrome
     // 1 - 4:2:0
     // 2 - 4:2:2
     // 3 - 4:4:4
-    sps.chroma_format_idc = get_ue_golomb_long(&gb);
+    evcc->chroma_format_idc = get_ue_golomb_long(&gb);
+    if (evcc->chroma_format_idc > 3)
+        return AVERROR_INVALIDDATA;
 
-    sps.pic_width_in_luma_samples = get_ue_golomb_long(&gb);
-    sps.pic_height_in_luma_samples = get_ue_golomb_long(&gb);
+    evcc->pic_width_in_luma_samples = get_ue_golomb_long(&gb);
+    evcc->pic_height_in_luma_samples = get_ue_golomb_long(&gb);
 
-    sps.bit_depth_luma_minus8 = get_ue_golomb_long(&gb);
-    sps.bit_depth_chroma_minus8 = get_ue_golomb_long(&gb);
-
-    evcc->profile_idc = sps.profile_idc;
-    evcc->level_idc = sps.level_idc;
-    evcc->toolset_idc_h = sps.toolset_idc_h;
-    evcc->toolset_idc_l = sps.toolset_idc_l;
-    evcc->chroma_format_idc = sps.chroma_format_idc;
-    evcc->bit_depth_luma_minus8 = sps.bit_depth_luma_minus8;
-    evcc->bit_depth_chroma_minus8 = sps.bit_depth_chroma_minus8;
-    evcc->pic_width_in_luma_samples = sps.pic_width_in_luma_samples;
-    evcc->pic_height_in_luma_samples = sps.pic_height_in_luma_samples;
+    evcc->bit_depth_luma_minus8 = get_ue_golomb_long(&gb);
+    evcc->bit_depth_chroma_minus8 = get_ue_golomb_long(&gb);
+    // EVCDecoderConfigurationRecord can't store values > 7. Limit it to bit depth 14.
+    if (evcc->bit_depth_luma_minus8 > 6 || evcc->bit_depth_chroma_minus8 > 6)
+        return AVERROR_INVALIDDATA;
 
     return 0;
 }
@@ -246,15 +207,15 @@ static int evcc_write(AVIOContext *pb, EVCDecoderConfigurationRecord *evcc)
         if(array->numNalus == 0)
             continue;
 
-        av_log(NULL, AV_LOG_TRACE, "array_completeness[%"PRIu8"]:               %"PRIu8"\n",
+        av_log(NULL, AV_LOG_TRACE, "array_completeness[%u]:               %"PRIu8"\n",
                i, array->array_completeness);
-        av_log(NULL, AV_LOG_TRACE, "NAL_unit_type[%"PRIu8"]:                    %"PRIu8"\n",
+        av_log(NULL, AV_LOG_TRACE, "NAL_unit_type[%u]:                    %"PRIu8"\n",
                i, array->NAL_unit_type);
-        av_log(NULL, AV_LOG_TRACE, "numNalus[%"PRIu8"]:                         %"PRIu16"\n",
+        av_log(NULL, AV_LOG_TRACE, "numNalus[%u]:                         %"PRIu16"\n",
                i, array->numNalus);
         for ( unsigned j = 0; j < array->numNalus; j++)
             av_log(NULL, AV_LOG_TRACE,
-                   "nalUnitLength[%"PRIu8"][%"PRIu16"]:                 %"PRIu16"\n",
+                   "nalUnitLength[%u][%u]:                 %"PRIu16"\n",
                    i, j, array->nalUnitLength[j]);
     }
 
@@ -265,16 +226,13 @@ static int evcc_write(AVIOContext *pb, EVCDecoderConfigurationRecord *evcc)
     if (!sps_count || sps_count > EVC_MAX_SPS_COUNT)
         return AVERROR_INVALIDDATA;
 
-    if (!sps_count || sps_count > EVC_MAX_SPS_COUNT)
-        return AVERROR_INVALIDDATA;
-
     /* unsigned int(8) configurationVersion = 1; */
     avio_w8(pb, evcc->configurationVersion);
 
     /* unsigned int(8) profile_idc */
     avio_w8(pb, evcc->profile_idc);
 
-    /* unsigned int(8) profile_idc */
+    /* unsigned int(8) level_idc */
     avio_w8(pb, evcc->level_idc);
 
     /* unsigned int(32) toolset_idc_h */
@@ -295,14 +253,14 @@ static int evcc_write(AVIOContext *pb, EVCDecoderConfigurationRecord *evcc)
     /* unsigned int(16) pic_width_in_luma_samples; */
     avio_wb16(pb, evcc->pic_width_in_luma_samples);
 
-    /* unsigned int(16) pic_width_in_luma_samples; */
+    /* unsigned int(16) pic_height_in_luma_samples; */
     avio_wb16(pb, evcc->pic_height_in_luma_samples);
 
     /*
-     * bit(6) reserved = '111111'b;
-     * unsigned int(2) chromaFormat;
+     * unsigned int(6) reserved = '000000'b;
+     * unsigned int(2) lengthSizeMinusOne;
      */
-    avio_w8(pb, evcc->lengthSizeMinusOne | 0xfc);
+    avio_w8(pb, evcc->lengthSizeMinusOne & 0x3);
 
     /* unsigned int(8) numOfArrays; */
     avio_w8(pb, evcc->num_of_arrays);

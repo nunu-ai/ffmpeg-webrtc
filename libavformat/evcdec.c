@@ -20,17 +20,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavcodec/get_bits.h"
-#include "libavcodec/golomb.h"
-#include "libavcodec/internal.h"
 #include "libavcodec/evc.h"
 #include "libavcodec/bsf.h"
 
 #include "libavutil/opt.h"
 
-#include "rawdec.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "evc.h"
 #include "internal.h"
 
@@ -65,7 +62,7 @@ static int annexb_probe(const AVProbeData *p)
     int nalu_type;
     size_t nalu_size;
     int got_sps = 0, got_pps = 0, got_idr = 0, got_nonidr = 0;
-    unsigned char *bits = (unsigned char *)p->buf;
+    const unsigned char *bits = p->buf;
     int bytes_to_read = p->buf_size;
 
     while (bytes_to_read > EVC_NALU_LENGTH_PREFIX_SIZE) {
@@ -159,11 +156,13 @@ static int evc_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret < 0)
             return ret;
 
-        ret = avio_read(s->pb, (unsigned char *)&buf, EVC_NALU_LENGTH_PREFIX_SIZE);
+        ret = avio_read(s->pb, buf, EVC_NALU_LENGTH_PREFIX_SIZE);
         if (ret < 0)
             return ret;
+        if (ret != EVC_NALU_LENGTH_PREFIX_SIZE)
+            return AVERROR_INVALIDDATA;
 
-        nalu_size = evc_read_nal_unit_length((const uint8_t *)&buf, EVC_NALU_LENGTH_PREFIX_SIZE);
+        nalu_size = evc_read_nal_unit_length(buf, EVC_NALU_LENGTH_PREFIX_SIZE);
         if (!nalu_size || nalu_size > INT_MAX)
             return AVERROR_INVALIDDATA;
 
@@ -203,17 +202,17 @@ static int evc_read_close(AVFormatContext *s)
     return 0;
 }
 
-const AVInputFormat ff_evc_demuxer = {
-    .name           = "evc",
-    .long_name      = NULL_IF_CONFIG_SMALL("EVC Annex B"),
+const FFInputFormat ff_evc_demuxer = {
+    .p.name         = "evc",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("EVC Annex B"),
+    .p.extensions   = "evc",
+    .p.flags        = AVFMT_GENERIC_INDEX | AVFMT_NOTIMESTAMPS,
+    .p.priv_class   = &evc_demuxer_class,
     .read_probe     = annexb_probe,
     .read_header    = evc_read_header, // annexb_read_header
     .read_packet    = evc_read_packet, // annexb_read_packet
     .read_close     = evc_read_close,
-    .extensions     = "evc",
-    .flags          = AVFMT_GENERIC_INDEX | AVFMT_NOTIMESTAMPS,
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .raw_codec_id   = AV_CODEC_ID_EVC,
     .priv_data_size = sizeof(EVCDemuxContext),
-    .priv_class     = &evc_demuxer_class,
 };

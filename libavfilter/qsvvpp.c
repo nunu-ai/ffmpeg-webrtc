@@ -23,6 +23,7 @@
 
 #include "libavutil/common.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/time.h"
 #include "libavutil/pixdesc.h"
 
@@ -307,7 +308,7 @@ static int fill_frameinfo_by_link(mfxFrameInfo *frameinfo, AVFilterLink *link)
 
         frames_ctx   = (AVHWFramesContext *)link->hw_frames_ctx->data;
         frames_hwctx = frames_ctx->hwctx;
-        *frameinfo   = frames_hwctx->surfaces[0].Info;
+        *frameinfo   = frames_hwctx->nb_surfaces ? frames_hwctx->surfaces[0].Info : *frames_hwctx->info;
     } else {
         pix_fmt = link->format;
         desc = av_pix_fmt_desc_get(pix_fmt);
@@ -440,11 +441,6 @@ static QSVFrame *submit_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *p
                 av_frame_free(&qsv_frame->frame);
                 return NULL;
             }
-
-            if (av_frame_copy_props(qsv_frame->frame, picref) < 0) {
-                av_frame_free(&qsv_frame->frame);
-                return NULL;
-            }
         } else
             qsv_frame->frame = av_frame_clone(picref);
 
@@ -493,12 +489,6 @@ static QSVFrame *query_frame(QSVVPPContext *s, AVFilterLink *outlink, const AVFr
         if (!out_frame->frame)
             return NULL;
 
-        ret = av_frame_copy_props(out_frame->frame, in);
-        if (ret < 0) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to copy metadata fields from src to dst.\n");
-            return NULL;
-        }
-
         ret = av_hwframe_get_buffer(outlink->hw_frames_ctx, out_frame->frame, 0);
         if (ret < 0) {
             av_log(ctx, AV_LOG_ERROR, "Can't allocate a surface.\n");
@@ -514,12 +504,6 @@ static QSVFrame *query_frame(QSVVPPContext *s, AVFilterLink *outlink, const AVFr
                                                FFALIGN(outlink->h, 64));
         if (!out_frame->frame)
             return NULL;
-
-        ret = av_frame_copy_props(out_frame->frame, in);
-        if (ret < 0) {
-            av_log(ctx, AV_LOG_ERROR, "Failed to copy metadata fields from src to dst.\n");
-            return NULL;
-        }
 
         ret = map_frame_to_surface(out_frame->frame,
                                    &out_frame->surface);
@@ -540,14 +524,19 @@ static QSVFrame *query_frame(QSVVPPContext *s, AVFilterLink *outlink, const AVFr
         mfxExtBuffer *extbuf = s->vpp_param.ExtParam[i];
 
         if (extbuf->BufferId == MFX_EXTBUFF_VPP_DEINTERLACING) {
+#if FF_API_INTERLACED_FRAME
+FF_DISABLE_DEPRECATION_WARNINGS
             out_frame->frame->interlaced_frame = 0;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+            out_frame->frame->flags &= ~AV_FRAME_FLAG_INTERLACED;
             break;
         }
     }
 
     out_frame->surface.Info.PicStruct =
-        !out_frame->frame->interlaced_frame ? MFX_PICSTRUCT_PROGRESSIVE :
-        (out_frame->frame->top_field_first ? MFX_PICSTRUCT_FIELD_TFF :
+        !(out_frame->frame->flags & AV_FRAME_FLAG_INTERLACED) ? MFX_PICSTRUCT_PROGRESSIVE :
+        ((out_frame->frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? MFX_PICSTRUCT_FIELD_TFF :
          MFX_PICSTRUCT_FIELD_BFF);
 
     return out_frame;
@@ -598,6 +587,26 @@ static int init_vpp_session(AVFilterContext *avctx, QSVVPPContext *s)
     device_ctx   = (AVHWDeviceContext *)device_ref->data;
     device_hwctx = device_ctx->hwctx;
 
+    /* extract the properties of the "master" session given to us */
+    ret = MFXQueryIMPL(device_hwctx->session, &impl);
+    if (ret == MFX_ERR_NONE)
+        ret = MFXQueryVersion(device_hwctx->session, &ver);
+    if (ret != MFX_ERR_NONE) {
+        av_log(avctx, AV_LOG_ERROR, "Error querying the session attributes\n");
+        return AVERROR_UNKNOWN;
+    }
+
+    if (MFX_IMPL_VIA_VAAPI == MFX_IMPL_VIA_MASK(impl)) {
+        handle_type = MFX_HANDLE_VA_DISPLAY;
+    } else if (MFX_IMPL_VIA_D3D11 == MFX_IMPL_VIA_MASK(impl)) {
+        handle_type = MFX_HANDLE_D3D11_DEVICE;
+    } else if (MFX_IMPL_VIA_D3D9 == MFX_IMPL_VIA_MASK(impl)) {
+        handle_type = MFX_HANDLE_D3D9_DEVICE_MANAGER;
+    } else {
+        av_log(avctx, AV_LOG_ERROR, "Error unsupported handle type\n");
+        return AVERROR_UNKNOWN;
+    }
+
     if (outlink->format == AV_PIX_FMT_QSV) {
         AVHWFramesContext *out_frames_ctx;
         AVBufferRef *out_frames_ref = av_hwframe_ctx_alloc(device_ref);
@@ -619,9 +628,15 @@ static int init_vpp_session(AVFilterContext *avctx, QSVVPPContext *s)
         out_frames_ctx->width             = FFALIGN(outlink->w, 32);
         out_frames_ctx->height            = FFALIGN(outlink->h, 32);
         out_frames_ctx->sw_format         = s->out_sw_format;
-        out_frames_ctx->initial_pool_size = 64;
-        if (avctx->extra_hw_frames > 0)
-            out_frames_ctx->initial_pool_size += avctx->extra_hw_frames;
+
+        if (QSV_RUNTIME_VERSION_ATLEAST(ver, 2, 9) && handle_type != MFX_HANDLE_D3D9_DEVICE_MANAGER)
+            out_frames_ctx->initial_pool_size = 0;
+        else {
+            out_frames_ctx->initial_pool_size = 64;
+            if (avctx->extra_hw_frames > 0)
+                out_frames_ctx->initial_pool_size += avctx->extra_hw_frames;
+        }
+
         out_frames_hwctx->frame_type      = s->out_mem_mode;
 
         ret = av_hwframe_ctx_init(out_frames_ref);
@@ -646,26 +661,6 @@ static int init_vpp_session(AVFilterContext *avctx, QSVVPPContext *s)
         outlink->hw_frames_ctx = out_frames_ref;
     } else
         s->out_mem_mode = MFX_MEMTYPE_SYSTEM_MEMORY;
-
-    /* extract the properties of the "master" session given to us */
-    ret = MFXQueryIMPL(device_hwctx->session, &impl);
-    if (ret == MFX_ERR_NONE)
-        ret = MFXQueryVersion(device_hwctx->session, &ver);
-    if (ret != MFX_ERR_NONE) {
-        av_log(avctx, AV_LOG_ERROR, "Error querying the session attributes\n");
-        return AVERROR_UNKNOWN;
-    }
-
-    if (MFX_IMPL_VIA_VAAPI == MFX_IMPL_VIA_MASK(impl)) {
-        handle_type = MFX_HANDLE_VA_DISPLAY;
-    } else if (MFX_IMPL_VIA_D3D11 == MFX_IMPL_VIA_MASK(impl)) {
-        handle_type = MFX_HANDLE_D3D11_DEVICE;
-    } else if (MFX_IMPL_VIA_D3D9 == MFX_IMPL_VIA_MASK(impl)) {
-        handle_type = MFX_HANDLE_D3D9_DEVICE_MANAGER;
-    } else {
-        av_log(avctx, AV_LOG_ERROR, "Error unsupported handle type\n");
-        return AVERROR_UNKNOWN;
-    }
 
     ret = MFXVideoCORE_GetHandle(device_hwctx->session, handle_type, &handle);
     if (ret < 0)
@@ -731,6 +726,11 @@ static int init_vpp_session(AVFilterContext *avctx, QSVVPPContext *s)
     return 0;
 }
 
+static int set_frame_ext_params_null(AVFilterContext *ctx, const AVFrame *in, AVFrame *out, QSVVPPFrameParam *fp)
+{
+    return 0;
+}
+
 int ff_qsvvpp_init(AVFilterContext *avctx, QSVVPPParam *param)
 {
     int i;
@@ -741,6 +741,10 @@ int ff_qsvvpp_init(AVFilterContext *avctx, QSVVPPParam *param)
     if (!s->filter_frame)
         s->filter_frame = ff_filter_frame;
     s->out_sw_format = param->out_sw_format;
+
+    s->set_frame_ext_params = param->set_frame_ext_params;
+    if (!s->set_frame_ext_params)
+        s->set_frame_ext_params = set_frame_ext_params_null;
 
     /* create the vpp session */
     ret = init_vpp_session(avctx, s);
@@ -868,27 +872,53 @@ failed:
 static int qsvvpp_init_vpp_session(AVFilterContext *avctx, QSVVPPContext *s, const QSVFrame *in, QSVFrame *out)
 {
     int ret;
+    mfxExtBuffer *ext_param[QSVVPP_MAX_FRAME_EXTBUFS];
+    QSVVPPFrameParam fp = { 0, ext_param };
 
-    if (s->vpp_initted)
-        return 0;
+    ret = s->set_frame_ext_params(avctx, in->frame, out->frame, &fp);
+    if (ret)
+        return ret;
 
-    s->vpp_param.vpp.In.PicStruct = in->surface.Info.PicStruct;
-    s->vpp_param.vpp.Out.PicStruct = out->surface.Info.PicStruct;
+    if (fp.num_ext_buf) {
+        av_freep(&s->ext_buffers);
+        s->nb_ext_buffers = s->nb_seq_buffers + fp.num_ext_buf;
 
-    /* Query VPP params again, including params for frame */
-    ret = MFXVideoVPP_Query(s->session, &s->vpp_param, &s->vpp_param);
-    if (ret < 0)
-        return ff_qsvvpp_print_error(avctx, ret, "Error querying VPP params");
-    else if (ret > 0)
-        ff_qsvvpp_print_warning(avctx, ret, "Warning When querying VPP params");
+        s->ext_buffers = av_calloc(s->nb_ext_buffers, sizeof(*s->ext_buffers));
+        if (!s->ext_buffers)
+            return AVERROR(ENOMEM);
 
-    ret = MFXVideoVPP_Init(s->session, &s->vpp_param);
-    if (ret < 0)
-        return ff_qsvvpp_print_error(avctx, ret, "Failed to create a qsvvpp");
-    else if (ret > 0)
-        ff_qsvvpp_print_warning(avctx, ret, "Warning When creating qsvvpp");
+        memcpy(&s->ext_buffers[0], s->seq_buffers, s->nb_seq_buffers * sizeof(*s->seq_buffers));
+        memcpy(&s->ext_buffers[s->nb_seq_buffers], fp.ext_buf, fp.num_ext_buf * sizeof(*fp.ext_buf));
+        s->vpp_param.ExtParam    = s->ext_buffers;
+        s->vpp_param.NumExtParam = s->nb_ext_buffers;
+    }
 
-    s->vpp_initted = 1;
+    if (!s->vpp_initted) {
+        s->vpp_param.vpp.In.PicStruct = in->surface.Info.PicStruct;
+        s->vpp_param.vpp.Out.PicStruct = out->surface.Info.PicStruct;
+
+        /* Query VPP params again, including params for frame */
+        ret = MFXVideoVPP_Query(s->session, &s->vpp_param, &s->vpp_param);
+        if (ret < 0)
+            return ff_qsvvpp_print_error(avctx, ret, "Error querying VPP params");
+        else if (ret > 0)
+            ff_qsvvpp_print_warning(avctx, ret, "Warning When querying VPP params");
+
+        ret = MFXVideoVPP_Init(s->session, &s->vpp_param);
+        if (ret < 0)
+            return ff_qsvvpp_print_error(avctx, ret, "Failed to create a qsvvpp");
+        else if (ret > 0)
+            ff_qsvvpp_print_warning(avctx, ret, "Warning When creating qsvvpp");
+
+        s->vpp_initted = 1;
+    } else if (fp.num_ext_buf) {
+        ret = MFXVideoVPP_Reset(s->session, &s->vpp_param);
+        if (ret < 0) {
+            ret = ff_qsvvpp_print_error(avctx, ret, "Failed to reset session for qsvvpp");
+            return ret;
+        } else if (ret > 0)
+            ff_qsvvpp_print_warning(avctx, ret, "Warning When resetting session for qsvvpp");
+    }
 
     return 0;
 }
@@ -917,7 +947,7 @@ int ff_qsvvpp_close(AVFilterContext *avctx)
     return 0;
 }
 
-int ff_qsvvpp_filter_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *picref)
+int ff_qsvvpp_filter_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *picref, AVFrame *propref)
 {
     AVFilterContext  *ctx     = inlink->dst;
     AVFilterLink     *outlink = ctx->outputs[0];
@@ -974,6 +1004,16 @@ int ff_qsvvpp_filter_frame(QSVVPPContext *s, AVFilterLink *inlink, AVFrame *picr
                 return AVERROR(EAGAIN);
             break;
         }
+
+        if (propref) {
+            ret1 = av_frame_copy_props(out_frame->frame, propref);
+            if (ret1 < 0) {
+                av_frame_free(&out_frame->frame);
+                av_log(ctx, AV_LOG_ERROR, "Failed to copy metadata fields from src to dst.\n");
+                return ret1;
+            }
+        }
+
         out_frame->frame->pts = av_rescale_q(out_frame->surface.Data.TimeStamp,
                                              default_tb, outlink->time_base);
 
@@ -1059,11 +1099,6 @@ int ff_qsvvpp_create_mfx_session(void *ctx,
     if (sts < 0)
         return ff_qsvvpp_print_error(ctx, sts,
                                      "Error creating a MFX session");
-    else if (sts > 0) {
-        ff_qsvvpp_print_warning(ctx, sts,
-                                "Warning in MFX session creation");
-        return AVERROR_UNKNOWN;
-    }
 
     *psession = session;
 

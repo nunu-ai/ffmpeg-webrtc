@@ -28,12 +28,13 @@
 
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
 #include "internal.h"
+#include "video.h"
 
 typedef struct KerndeintContext {
     const AVClass *class;
@@ -294,13 +295,6 @@ static const AVFilterPad kerndeint_inputs[] = {
     },
 };
 
-static const AVFilterPad kerndeint_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
 
 const AVFilter ff_vf_kerndeint = {
     .name          = "kerndeint",
@@ -309,6 +303,6 @@ const AVFilter ff_vf_kerndeint = {
     .priv_class    = &kerndeint_class,
     .uninit        = uninit,
     FILTER_INPUTS(kerndeint_inputs),
-    FILTER_OUTPUTS(kerndeint_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

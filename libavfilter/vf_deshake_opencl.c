@@ -48,17 +48,16 @@
 #include <float.h>
 #include <libavutil/lfg.h>
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/fifo.h"
 #include "libavutil/common.h"
 #include "libavutil/avassert.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "avfilter.h"
 #include "framequeue.h"
 #include "filters.h"
 #include "transform.h"
-#include "formats.h"
 #include "internal.h"
 #include "opencl.h"
 #include "opencl_source.h"
@@ -704,7 +703,7 @@ static int minimize_error(
             total_err += deshake_ctx->ransac_err[j];
         }
 
-        if (total_err < best_err) {
+        if (i == 0 || total_err < best_err) {
             for (int mi = 0; mi < 6; ++mi) {
                 best_model[mi] = model[mi];
             }
@@ -1388,8 +1387,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     size_t global_work[2];
     int64_t duration;
     cl_mem src, transformed, dst;
-    cl_mem transforms[3];
-    CropInfo crops[3];
+    cl_mem transforms[AV_VIDEO_MAX_PLANES];
+    CropInfo crops[AV_VIDEO_MAX_PLANES];
     cl_event transform_event, crop_upscale_event;
     DebugMatches debug_matches;
     cl_int num_model_matches;
@@ -1413,13 +1412,6 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
             &debug_matches, 1);
     }
 
-#if FF_API_PKT_DURATION
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (input_frame->pkt_duration) {
-        duration = input_frame->pkt_duration;
-    } else
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     if (input_frame->duration) {
         duration = input_frame->duration;
     } else {
@@ -1526,7 +1518,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
     transforms[0] = deshake_ctx->transform_y;
     transforms[1] = transforms[2] = deshake_ctx->transform_uv;
 
-    for (int p = 0; p < FF_ARRAY_ELEMS(transformed_frame->data); p++) {
+    for (int p = 0; p < AV_VIDEO_MAX_PLANES; p++) {
         // Transform all of the planes appropriately
         src = (cl_mem)input_frame->data[p];
         transformed = (cl_mem)transformed_frame->data[p];
@@ -1627,7 +1619,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
         crops[0] = deshake_ctx->crop_y;
         crops[1] = crops[2] = deshake_ctx->crop_uv;
 
-        for (int p = 0; p < FF_ARRAY_ELEMS(cropped_frame->data); p++) {
+        for (int p = 0; p < AV_VIDEO_MAX_PLANES; p++) {
             // Crop all of the planes appropriately
             dst = (cl_mem)cropped_frame->data[p];
             transformed = (cl_mem)transformed_frame->data[p];

@@ -16,14 +16,21 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "hevcdec.h"
-#include "hevc_ps.h"
+#include "libavutil/mem.h"
+#include "hevc/hevcdec.h"
+#include "hevc/data.h"
+#include "hevc/ps.h"
 
 #include "vulkan_decode.h"
 
-const VkExtensionProperties ff_vk_dec_hevc_ext = {
-    .extensionName = VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_EXTENSION_NAME,
-    .specVersion   = VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_SPEC_VERSION,
+const FFVulkanDecodeDescriptor ff_vk_dec_hevc_desc = {
+    .codec_id         = AV_CODEC_ID_HEVC,
+    .decode_extension = FF_VK_EXT_VIDEO_DECODE_H265,
+    .decode_op        = VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR,
+    .ext_props = {
+        .extensionName = VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_EXTENSION_NAME,
+        .specVersion   = VK_STD_VULKAN_VIDEO_CODEC_H265_DECODE_SPEC_VERSION,
+    },
 };
 
 typedef struct HEVCHeaderSPS {
@@ -67,51 +74,36 @@ typedef struct HEVCHeaderSet {
     HEVCHeaderVPS *hvps;
 } HEVCHeaderSet;
 
-static int get_data_set_buf(FFVulkanDecodeContext *s, AVBufferRef **data_buf,
-                            int nb_vps, AVBufferRef * const vps_list[HEVC_MAX_VPS_COUNT])
+static int alloc_hevc_header_structs(FFVulkanDecodeContext *s,
+                                     int nb_vps,
+                                     const int vps_list_idx[HEVC_MAX_VPS_COUNT],
+                                     const HEVCVPS * const vps_list[HEVC_MAX_VPS_COUNT])
 {
     uint8_t *data_ptr;
     HEVCHeaderSet *hdr;
 
-    size_t base_size = sizeof(StdVideoH265SequenceParameterSet)*HEVC_MAX_SPS_COUNT +
-                       sizeof(HEVCHeaderSPS)*HEVC_MAX_SPS_COUNT +
-                       sizeof(StdVideoH265PictureParameterSet)*HEVC_MAX_PPS_COUNT +
-                       sizeof(HEVCHeaderPPS)*HEVC_MAX_PPS_COUNT +
-                       sizeof(StdVideoH265VideoParameterSet)*HEVC_MAX_VPS_COUNT +
-                       sizeof(HEVCHeaderVPS *);
-
-    size_t vps_size = sizeof(StdVideoH265ProfileTierLevel) +
-                      sizeof(StdVideoH265DecPicBufMgr) +
-                      sizeof(StdVideoH265HrdParameters)*HEVC_MAX_LAYER_SETS +
-                      sizeof(HEVCHeaderVPSSet *);
-
-    size_t buf_size = base_size + vps_size*nb_vps;
-
+    size_t buf_size = sizeof(HEVCHeaderSet) + nb_vps*sizeof(HEVCHeaderVPS);
     for (int i = 0; i < nb_vps; i++) {
-        const HEVCVPS *vps = (const HEVCVPS *)vps_list[i]->data;
+        const HEVCVPS *vps = vps_list[vps_list_idx[i]];
         buf_size += sizeof(HEVCHeaderVPSSet)*vps->vps_num_hrd_parameters;
     }
 
-    if (buf_size > s->tmp_pool_ele_size) {
-        av_buffer_pool_uninit(&s->tmp_pool);
-        s->tmp_pool_ele_size = 0;
-        s->tmp_pool = av_buffer_pool_init(buf_size, NULL);
-        if (!s->tmp_pool)
+    if (buf_size > s->hevc_headers_size) {
+        av_freep(&s->hevc_headers);
+        s->hevc_headers_size = 0;
+        s->hevc_headers = av_mallocz(buf_size);
+        if (!s->hevc_headers)
             return AVERROR(ENOMEM);
-        s->tmp_pool_ele_size = buf_size;
+        s->hevc_headers_size = buf_size;
     }
 
-    *data_buf = av_buffer_pool_get(s->tmp_pool);
-    if (!(*data_buf))
-        return AVERROR(ENOMEM);
-
-    /* Setup pointers */
-    data_ptr = (*data_buf)->data;
-    hdr = (HEVCHeaderSet *)data_ptr;
-    hdr->hvps = (HEVCHeaderVPS *)(data_ptr + base_size);
-    data_ptr += base_size + vps_size*nb_vps;
+    /* Setup struct pointers */
+    hdr = s->hevc_headers;
+    data_ptr = (uint8_t *)hdr;
+    hdr->hvps = (HEVCHeaderVPS *)(data_ptr + sizeof(HEVCHeaderSet));
+    data_ptr += sizeof(HEVCHeaderSet) + nb_vps*sizeof(HEVCHeaderVPS);
     for (int i = 0; i < nb_vps; i++) {
-        const HEVCVPS *vps = (const HEVCVPS *)vps_list[i]->data;
+        const HEVCVPS *vps = vps_list[vps_list_idx[i]];
         hdr->hvps[i].sls = (HEVCHeaderVPSSet *)data_ptr;
         data_ptr += sizeof(HEVCHeaderVPSSet)*vps->vps_num_hrd_parameters;
     }
@@ -147,7 +139,7 @@ static int vk_hevc_fill_pict(AVCodecContext *avctx, HEVCFrame **ref_src,
     HEVCVulkanDecodePicture *hp = pic->hwaccel_picture_private;
     FFVulkanDecodePicture *vkpic = &hp->vp;
 
-    int err = ff_vk_decode_prepare_frame(dec, pic->frame, vkpic, is_current,
+    int err = ff_vk_decode_prepare_frame(dec, pic->f, vkpic, is_current,
                                          dec->dedicated_dpb);
     if (err < 0)
         return err;
@@ -168,7 +160,7 @@ static int vk_hevc_fill_pict(AVCodecContext *avctx, HEVCFrame **ref_src,
     *ref = (VkVideoPictureResourceInfoKHR) {
         .sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,
         .codedOffset = (VkOffset2D){ 0, 0 },
-        .codedExtent = (VkExtent2D){ pic->frame->width, pic->frame->height },
+        .codedExtent = (VkExtent2D){ pic->f->width, pic->f->height },
         .baseArrayLayer = dec->layered_dpb ? pic_id : 0,
         .imageViewBinding = vkpic->img_view_ref,
     };
@@ -205,6 +197,43 @@ static StdVideoH265LevelIdc convert_to_vk_level_idc(int level_idc)
     }
 }
 
+static void copy_scaling_list(const ScalingList *sl, StdVideoH265ScalingLists *vksl)
+{
+    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_4X4_NUM_LISTS; i++) {
+        for (int j = 0; j < STD_VIDEO_H265_SCALING_LIST_4X4_NUM_ELEMENTS; j++) {
+            uint8_t pos = 4 * ff_hevc_diag_scan4x4_y[j] + ff_hevc_diag_scan4x4_x[j];
+            vksl->ScalingList4x4[i][j] = sl->sl[0][i][pos];
+        }
+    }
+
+    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_8X8_NUM_LISTS; i++) {
+        for (int j = 0; j < STD_VIDEO_H265_SCALING_LIST_8X8_NUM_ELEMENTS; j++) {
+            uint8_t pos = 8 * ff_hevc_diag_scan8x8_y[j] + ff_hevc_diag_scan8x8_x[j];
+            vksl->ScalingList8x8[i][j] = sl->sl[1][i][pos];
+        }
+    }
+
+    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_16X16_NUM_LISTS; i++) {
+        for (int j = 0; j < STD_VIDEO_H265_SCALING_LIST_16X16_NUM_ELEMENTS; j++) {
+            uint8_t pos = 8 * ff_hevc_diag_scan8x8_y[j] + ff_hevc_diag_scan8x8_x[j];
+            vksl->ScalingList16x16[i][j] = sl->sl[2][i][pos];
+        }
+    }
+
+    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_32X32_NUM_LISTS; i++) {
+        for (int j = 0; j < STD_VIDEO_H265_SCALING_LIST_32X32_NUM_ELEMENTS; j++) {
+            uint8_t pos = 8 * ff_hevc_diag_scan8x8_y[j] + ff_hevc_diag_scan8x8_x[j];
+            vksl->ScalingList32x32[i][j] = sl->sl[3][i * 3][pos];
+        }
+    }
+
+    memcpy(vksl->ScalingListDCCoef16x16, sl->sl_dc[0],
+           STD_VIDEO_H265_SCALING_LIST_16X16_NUM_LISTS * sizeof(*vksl->ScalingListDCCoef16x16));
+
+    for (int i = 0; i <  STD_VIDEO_H265_SCALING_LIST_32X32_NUM_LISTS; i++)
+        vksl->ScalingListDCCoef32x32[i] = sl->sl_dc[1][i * 3];
+}
+
 static void set_sps(const HEVCSPS *sps, int sps_idx,
                     StdVideoH265ScalingLists *vksps_scaling,
                     StdVideoH265HrdParameters *vksps_vui_header,
@@ -218,34 +247,14 @@ static void set_sps(const HEVCSPS *sps, int sps_idx,
                     StdVideoH265ShortTermRefPicSet *str,
                     StdVideoH265LongTermRefPicsSps *ltr)
 {
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_4X4_NUM_LISTS; i++)
-        memcpy(vksps_scaling->ScalingList4x4[i], sps->scaling_list.sl[0][i],
-               STD_VIDEO_H265_SCALING_LIST_4X4_NUM_ELEMENTS * sizeof(**vksps_scaling->ScalingList4x4));
-
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_8X8_NUM_LISTS; i++)
-        memcpy(vksps_scaling->ScalingList8x8[i], sps->scaling_list.sl[1][i],
-               STD_VIDEO_H265_SCALING_LIST_8X8_NUM_ELEMENTS * sizeof(**vksps_scaling->ScalingList8x8));
-
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_16X16_NUM_LISTS; i++)
-        memcpy(vksps_scaling->ScalingList16x16[i], sps->scaling_list.sl[2][i],
-               STD_VIDEO_H265_SCALING_LIST_16X16_NUM_ELEMENTS * sizeof(**vksps_scaling->ScalingList16x16));
-
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_32X32_NUM_LISTS; i++)
-        memcpy(vksps_scaling->ScalingList32x32[i], sps->scaling_list.sl[3][i * 3],
-               STD_VIDEO_H265_SCALING_LIST_32X32_NUM_ELEMENTS * sizeof(**vksps_scaling->ScalingList32x32));
-
-    memcpy(vksps_scaling->ScalingListDCCoef16x16, sps->scaling_list.sl_dc[0],
-           STD_VIDEO_H265_SCALING_LIST_16X16_NUM_LISTS * sizeof(*vksps_scaling->ScalingListDCCoef16x16));
-
-    for (int i = 0; i <  STD_VIDEO_H265_SCALING_LIST_32X32_NUM_LISTS; i++)
-        vksps_scaling->ScalingListDCCoef32x32[i] = sps->scaling_list.sl_dc[1][i * 3];
+    copy_scaling_list(&sps->scaling_list, vksps_scaling);
 
     *vksps_vui_header = (StdVideoH265HrdParameters) {
         .flags = (StdVideoH265HrdFlags) {
-            .nal_hrd_parameters_present_flag = sps->hdr.flags.nal_hrd_parameters_present_flag,
-            .vcl_hrd_parameters_present_flag = sps->hdr.flags.vcl_hrd_parameters_present_flag,
-            .sub_pic_hrd_params_present_flag = sps->hdr.flags.sub_pic_hrd_params_present_flag,
-            .sub_pic_cpb_params_in_pic_timing_sei_flag = sps->hdr.flags.sub_pic_cpb_params_in_pic_timing_sei_flag,
+            .nal_hrd_parameters_present_flag = sps->hdr.nal_hrd_parameters_present_flag,
+            .vcl_hrd_parameters_present_flag = sps->hdr.vcl_hrd_parameters_present_flag,
+            .sub_pic_hrd_params_present_flag = sps->hdr.sub_pic_hrd_params_present_flag,
+            .sub_pic_cpb_params_in_pic_timing_sei_flag = sps->hdr.sub_pic_cpb_params_in_pic_timing_sei_flag,
             .fixed_pic_rate_general_flag = sps->hdr.flags.fixed_pic_rate_general_flag,
             .fixed_pic_rate_within_cvs_flag = sps->hdr.flags.fixed_pic_rate_within_cvs_flag,
             .low_delay_hrd_flag = sps->hdr.flags.low_delay_hrd_flag,
@@ -342,13 +351,15 @@ static void set_sps(const HEVCSPS *sps, int sps_idx,
             pal->PredictorPaletteEntries[i][j] = sps->sps_palette_predictor_initializer[i][j];
 
     for (int i = 0; i < sps->nb_st_rps; i++) {
+        const ShortTermRPS *st_rps = &sps->st_rps[i];
+
         str[i] = (StdVideoH265ShortTermRefPicSet) {
             .flags = (StdVideoH265ShortTermRefPicSetFlags) {
                 .inter_ref_pic_set_prediction_flag = sps->st_rps[i].rps_predict,
                 .delta_rps_sign = sps->st_rps[i].delta_rps_sign,
             },
             .delta_idx_minus1 = sps->st_rps[i].delta_idx - 1,
-            .use_delta_flag = sps->st_rps[i].use_delta_flag,
+            .use_delta_flag = sps->st_rps[i].use_delta,
             .abs_delta_rps_minus1 = sps->st_rps[i].abs_delta_rps - 1,
             .used_by_curr_pic_flag    = 0x0,
             .used_by_curr_pic_s0_flag = 0x0,
@@ -362,61 +373,58 @@ static void set_sps(const HEVCSPS *sps, int sps_idx,
 
         /* NOTE: This is the predicted, and *reordered* version.
          * Probably incorrect, but the spec doesn't say which version to use. */
-        for (int j = 0; j < sps->st_rps[i].num_delta_pocs; j++)
-            str[i].used_by_curr_pic_flag |= sps->st_rps[i].used[j] << j;
+        str[i].used_by_curr_pic_flag = st_rps->used;
+        str[i].used_by_curr_pic_s0_flag = av_zero_extend(st_rps->used, str[i].num_negative_pics);
+        str[i].used_by_curr_pic_s1_flag = st_rps->used >> str[i].num_negative_pics;
 
-        for (int j = 0; j < str[i].num_negative_pics; j++) {
-            str[i].delta_poc_s0_minus1[j] = sps->st_rps[i].delta_poc_s0[j] - 1;
-            str[i].used_by_curr_pic_s0_flag |= sps->st_rps[i].used[j] << j;
-        }
+        for (int j = 0; j < str[i].num_negative_pics; j++)
+            str[i].delta_poc_s0_minus1[j] = st_rps->delta_poc[j] - (j ? st_rps->delta_poc[j - 1] : 0) - 1;
 
-        for (int j = 0; j < str[i].num_positive_pics; j++) {
-            str[i].delta_poc_s1_minus1[j] = sps->st_rps[i].delta_poc_s1[j] - 1;
-            str[i].used_by_curr_pic_s0_flag |= sps->st_rps[i].used[str[i].num_negative_pics + j] << j;
-        }
+        for (int j = 0; j < str[i].num_positive_pics; j++)
+            str[i].delta_poc_s1_minus1[j] = st_rps->delta_poc[st_rps->num_negative_pics + j] -
+                                            (j ? st_rps->delta_poc[st_rps->num_negative_pics + j - 1] : 0) - 1;
     }
 
     *ltr = (StdVideoH265LongTermRefPicsSps) {
-        .used_by_curr_pic_lt_sps_flag = 0x0,
+        .used_by_curr_pic_lt_sps_flag = sps->used_by_curr_pic_lt,
     };
 
     for (int i = 0; i < sps->num_long_term_ref_pics_sps; i++) {
-        ltr->used_by_curr_pic_lt_sps_flag |= sps->used_by_curr_pic_lt_sps_flag[i] << i;
         ltr->lt_ref_pic_poc_lsb_sps[i]     = sps->lt_ref_pic_poc_lsb_sps[i];
     }
 
     *vksps = (StdVideoH265SequenceParameterSet) {
         .flags = (StdVideoH265SpsFlags) {
-            .sps_temporal_id_nesting_flag = sps->temporal_id_nesting_flag,
-            .separate_colour_plane_flag = sps->separate_colour_plane_flag,
-            .conformance_window_flag = sps->conformance_window_flag,
-            .sps_sub_layer_ordering_info_present_flag = sps->sublayer_ordering_info_flag,
-            .scaling_list_enabled_flag = sps->scaling_list_enable_flag,
-            .sps_scaling_list_data_present_flag = sps->scaling_list_enable_flag,
-            .amp_enabled_flag = sps->amp_enabled_flag,
+            .sps_temporal_id_nesting_flag = sps->temporal_id_nesting,
+            .separate_colour_plane_flag = sps->separate_colour_plane,
+            .conformance_window_flag = sps->conformance_window,
+            .sps_sub_layer_ordering_info_present_flag = sps->sublayer_ordering_info,
+            .scaling_list_enabled_flag = sps->scaling_list_enabled,
+            .sps_scaling_list_data_present_flag = sps->scaling_list_enabled,
+            .amp_enabled_flag = sps->amp_enabled,
             .sample_adaptive_offset_enabled_flag = sps->sao_enabled,
-            .pcm_enabled_flag = sps->pcm_enabled_flag,
-            .pcm_loop_filter_disabled_flag = sps->pcm.loop_filter_disable_flag,
-            .long_term_ref_pics_present_flag = sps->long_term_ref_pics_present_flag,
-            .sps_temporal_mvp_enabled_flag = sps->sps_temporal_mvp_enabled_flag,
-            .strong_intra_smoothing_enabled_flag = sps->sps_strong_intra_smoothing_enable_flag,
+            .pcm_enabled_flag = sps->pcm_enabled,
+            .pcm_loop_filter_disabled_flag = sps->pcm_loop_filter_disabled,
+            .long_term_ref_pics_present_flag = sps->long_term_ref_pics_present,
+            .sps_temporal_mvp_enabled_flag = sps->temporal_mvp_enabled,
+            .strong_intra_smoothing_enabled_flag = sps->strong_intra_smoothing_enabled,
             .vui_parameters_present_flag = sps->vui_present,
-            .sps_extension_present_flag = sps->sps_extension_present_flag,
-            .sps_range_extension_flag = sps->sps_range_extension_flag,
-            .transform_skip_rotation_enabled_flag = sps->transform_skip_rotation_enabled_flag,
-            .transform_skip_context_enabled_flag = sps->transform_skip_context_enabled_flag,
-            .implicit_rdpcm_enabled_flag = sps->implicit_rdpcm_enabled_flag,
-            .explicit_rdpcm_enabled_flag = sps->explicit_rdpcm_enabled_flag,
-            .extended_precision_processing_flag = sps->extended_precision_processing_flag,
-            .intra_smoothing_disabled_flag = sps->intra_smoothing_disabled_flag,
-            .high_precision_offsets_enabled_flag = sps->high_precision_offsets_enabled_flag,
-            .persistent_rice_adaptation_enabled_flag = sps->persistent_rice_adaptation_enabled_flag,
-            .cabac_bypass_alignment_enabled_flag = sps->cabac_bypass_alignment_enabled_flag,
-            .sps_scc_extension_flag = sps->sps_scc_extension_flag,
-            .sps_curr_pic_ref_enabled_flag = sps->sps_curr_pic_ref_enabled_flag,
-            .palette_mode_enabled_flag = sps->palette_mode_enabled_flag,
-            .sps_palette_predictor_initializers_present_flag = sps->sps_palette_predictor_initializers_present_flag,
-            .intra_boundary_filtering_disabled_flag = sps->intra_boundary_filtering_disabled_flag,
+            .sps_extension_present_flag = sps->extension_present,
+            .sps_range_extension_flag = sps->range_extension,
+            .transform_skip_rotation_enabled_flag = sps->transform_skip_rotation_enabled,
+            .transform_skip_context_enabled_flag = sps->transform_skip_context_enabled,
+            .implicit_rdpcm_enabled_flag = sps->implicit_rdpcm_enabled,
+            .explicit_rdpcm_enabled_flag = sps->explicit_rdpcm_enabled,
+            .extended_precision_processing_flag = sps->extended_precision_processing,
+            .intra_smoothing_disabled_flag = sps->intra_smoothing_disabled,
+            .high_precision_offsets_enabled_flag = sps->high_precision_offsets_enabled,
+            .persistent_rice_adaptation_enabled_flag = sps->persistent_rice_adaptation_enabled,
+            .cabac_bypass_alignment_enabled_flag = sps->cabac_bypass_alignment_enabled,
+            .sps_scc_extension_flag = sps->scc_extension,
+            .sps_curr_pic_ref_enabled_flag = sps->curr_pic_ref_enabled,
+            .palette_mode_enabled_flag = sps->palette_mode_enabled,
+            .sps_palette_predictor_initializers_present_flag = sps->palette_predictor_initializers_present,
+            .intra_boundary_filtering_disabled_flag = sps->intra_boundary_filtering_disabled,
         },
         .chroma_format_idc = sps->chroma_format_idc,
         .pic_width_in_luma_samples = sps->width,
@@ -464,27 +472,7 @@ static void set_pps(const HEVCPPS *pps, const HEVCSPS *sps,
                     StdVideoH265PictureParameterSet *vkpps,
                     StdVideoH265PredictorPaletteEntries *pal)
 {
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_4X4_NUM_LISTS; i++)
-        memcpy(vkpps_scaling->ScalingList4x4[i], pps->scaling_list.sl[0][i],
-               STD_VIDEO_H265_SCALING_LIST_4X4_NUM_ELEMENTS * sizeof(**vkpps_scaling->ScalingList4x4));
-
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_8X8_NUM_LISTS; i++)
-        memcpy(vkpps_scaling->ScalingList8x8[i], pps->scaling_list.sl[1][i],
-               STD_VIDEO_H265_SCALING_LIST_8X8_NUM_ELEMENTS * sizeof(**vkpps_scaling->ScalingList8x8));
-
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_16X16_NUM_LISTS; i++)
-        memcpy(vkpps_scaling->ScalingList16x16[i], pps->scaling_list.sl[2][i],
-               STD_VIDEO_H265_SCALING_LIST_16X16_NUM_ELEMENTS * sizeof(**vkpps_scaling->ScalingList16x16));
-
-    for (int i = 0; i < STD_VIDEO_H265_SCALING_LIST_32X32_NUM_LISTS; i++)
-        memcpy(vkpps_scaling->ScalingList32x32[i], pps->scaling_list.sl[3][i * 3],
-               STD_VIDEO_H265_SCALING_LIST_32X32_NUM_ELEMENTS * sizeof(**vkpps_scaling->ScalingList32x32));
-
-    memcpy(vkpps_scaling->ScalingListDCCoef16x16, pps->scaling_list.sl_dc[0],
-           STD_VIDEO_H265_SCALING_LIST_16X16_NUM_LISTS * sizeof(*vkpps_scaling->ScalingListDCCoef16x16));
-
-    for (int i = 0; i <  STD_VIDEO_H265_SCALING_LIST_32X32_NUM_LISTS; i++)
-        vkpps_scaling->ScalingListDCCoef32x32[i] = sps->scaling_list.sl_dc[1][i * 3];
+    copy_scaling_list(&pps->scaling_list, vkpps_scaling);
 
     *vkpps = (StdVideoH265PictureParameterSet) {
         .flags = (StdVideoH265PpsFlags) {
@@ -579,10 +567,10 @@ static void set_vps(const HEVCVPS *vps,
 
         sls_hdr[i] = (StdVideoH265HrdParameters) {
             .flags = (StdVideoH265HrdFlags) {
-                .nal_hrd_parameters_present_flag = src->flags.nal_hrd_parameters_present_flag,
-                .vcl_hrd_parameters_present_flag = src->flags.vcl_hrd_parameters_present_flag,
-                .sub_pic_hrd_params_present_flag = src->flags.sub_pic_hrd_params_present_flag,
-                .sub_pic_cpb_params_in_pic_timing_sei_flag = src->flags.sub_pic_cpb_params_in_pic_timing_sei_flag,
+                .nal_hrd_parameters_present_flag = src->nal_hrd_parameters_present_flag,
+                .vcl_hrd_parameters_present_flag = src->vcl_hrd_parameters_present_flag,
+                .sub_pic_hrd_params_present_flag = src->sub_pic_hrd_params_present_flag,
+                .sub_pic_cpb_params_in_pic_timing_sei_flag = src->sub_pic_cpb_params_in_pic_timing_sei_flag,
                 .fixed_pic_rate_general_flag = src->flags.fixed_pic_rate_general_flag,
                 .fixed_pic_rate_within_cvs_flag = src->flags.fixed_pic_rate_within_cvs_flag,
                 .low_delay_hrd_flag = src->flags.low_delay_hrd_flag,
@@ -652,11 +640,9 @@ static void set_vps(const HEVCVPS *vps,
 static int vk_hevc_create_params(AVCodecContext *avctx, AVBufferRef **buf)
 {
     int err;
-    VkResult ret;
     const HEVCContext *h = avctx->priv_data;
     FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
-    FFVulkanDecodeShared *ctx = (FFVulkanDecodeShared *)dec->shared_ref->data;
-    FFVulkanFunctions *vk = &ctx->s.vkfn;
+    FFVulkanDecodeShared *ctx = dec->shared_ctx;
 
     VkVideoDecodeH265SessionParametersAddInfoKHR h265_params_info = {
         .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR,
@@ -672,52 +658,53 @@ static int vk_hevc_create_params(AVCodecContext *avctx, AVBufferRef **buf)
         .sType = VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,
         .pNext = &h265_params,
         .videoSession = ctx->common.session,
-        .videoSessionParametersTemplate = NULL,
+        .videoSessionParametersTemplate = VK_NULL_HANDLE,
     };
 
-    int nb_vps = 0;
-    AVBufferRef *data_set;
     HEVCHeaderSet *hdr;
+    int nb_vps = 0;
+    int vps_list_idx[HEVC_MAX_VPS_COUNT];
 
-    AVBufferRef *tmp;
-    VkVideoSessionParametersKHR *par = av_malloc(sizeof(*par));
-    if (!par)
-        return AVERROR(ENOMEM);
+    for (int i = 0; i < HEVC_MAX_VPS_COUNT; i++)
+        if (h->ps.vps_list[i])
+            vps_list_idx[nb_vps++] = i;
 
-    for (int i = 0; h->ps.vps_list[i]; i++)
-        nb_vps++;
-
-    err = get_data_set_buf(dec, &data_set, nb_vps, h->ps.vps_list);
+    err = alloc_hevc_header_structs(dec, nb_vps, vps_list_idx, h->ps.vps_list);
     if (err < 0)
         return err;
 
-    hdr = (HEVCHeaderSet *)data_set->data;
+    hdr = dec->hevc_headers;
 
     h265_params_info.pStdSPSs = hdr->sps;
     h265_params_info.pStdPPSs = hdr->pps;
     h265_params_info.pStdVPSs = hdr->vps;
 
     /* SPS list */
-    for (int i = 0; h->ps.sps_list[i]; i++) {
-        const HEVCSPS *sps_l = (const HEVCSPS *)h->ps.sps_list[i]->data;
-        set_sps(sps_l, i, &hdr->hsps[i].scaling, &hdr->hsps[i].vui_header,
-                &hdr->hsps[i].vui, &hdr->sps[i], hdr->hsps[i].nal_hdr,
-                hdr->hsps[i].vcl_hdr, &hdr->hsps[i].ptl, &hdr->hsps[i].dpbm,
-                &hdr->hsps[i].pal, hdr->hsps[i].str, &hdr->hsps[i].ltr);
-        h265_params_info.stdSPSCount++;
+    for (int i = 0; i < HEVC_MAX_SPS_COUNT; i++) {
+        if (h->ps.sps_list[i]) {
+            const HEVCSPS *sps_l = h->ps.sps_list[i];
+            int idx = h265_params_info.stdSPSCount++;
+            set_sps(sps_l, i, &hdr->hsps[idx].scaling, &hdr->hsps[idx].vui_header,
+                    &hdr->hsps[idx].vui, &hdr->sps[idx], hdr->hsps[idx].nal_hdr,
+                    hdr->hsps[idx].vcl_hdr, &hdr->hsps[idx].ptl, &hdr->hsps[idx].dpbm,
+                    &hdr->hsps[idx].pal, hdr->hsps[idx].str, &hdr->hsps[idx].ltr);
+        }
     }
 
     /* PPS list */
-    for (int i = 0; h->ps.pps_list[i]; i++) {
-        const HEVCPPS *pps_l = (const HEVCPPS *)h->ps.pps_list[i]->data;
-        const HEVCSPS *sps_l = (const HEVCSPS *)h->ps.sps_list[pps_l->sps_id]->data;
-        set_pps(pps_l, sps_l, &hdr->hpps[i].scaling, &hdr->pps[i], &hdr->hpps[i].pal);
-        h265_params_info.stdPPSCount++;
+    for (int i = 0; i < HEVC_MAX_PPS_COUNT; i++) {
+        if (h->ps.pps_list[i]) {
+            const HEVCPPS *pps_l = h->ps.pps_list[i];
+            const HEVCSPS *sps_l = h->ps.sps_list[pps_l->sps_id];
+            int idx = h265_params_info.stdPPSCount++;
+            set_pps(pps_l, sps_l, &hdr->hpps[idx].scaling,
+                    &hdr->pps[idx], &hdr->hpps[idx].pal);
+        }
     }
 
     /* VPS list */
     for (int i = 0; i < nb_vps; i++) {
-        const HEVCVPS *vps_l = (const HEVCVPS *)h->ps.vps_list[i]->data;
+        const HEVCVPS *vps_l = h->ps.vps_list[vps_list_idx[i]];
         set_vps(vps_l, &hdr->vps[i], &hdr->hvps[i].ptl, &hdr->hvps[i].dpbm,
                 hdr->hvps[i].hdr, hdr->hvps[i].sls);
         h265_params_info.stdVPSCount++;
@@ -727,28 +714,13 @@ static int vk_hevc_create_params(AVCodecContext *avctx, AVBufferRef **buf)
     h265_params.maxStdPPSCount = h265_params_info.stdPPSCount;
     h265_params.maxStdVPSCount = h265_params_info.stdVPSCount;
 
-    /* Create session parameters */
-    ret = vk->CreateVideoSessionParametersKHR(ctx->s.hwctx->act_dev, &session_params_create,
-                                              ctx->s.hwctx->alloc, par);
-    av_buffer_unref(&data_set);
-    if (ret != VK_SUCCESS) {
-        av_log(avctx, AV_LOG_ERROR, "Unable to create Vulkan video session parameters: %s!\n",
-               ff_vk_ret2str(ret));
-        return AVERROR_EXTERNAL;
-    }
-
-    tmp = av_buffer_create((uint8_t *)par, sizeof(*par), ff_vk_decode_free_params,
-                           ctx, 0);
-    if (!tmp) {
-        ff_vk_decode_free_params(ctx, (uint8_t *)par);
-        return AVERROR(ENOMEM);
-    }
+    err = ff_vk_decode_create_params(buf, avctx, ctx, &session_params_create);
+    if (err < 0)
+        return err;
 
     av_log(avctx, AV_LOG_DEBUG, "Created frame parameters: %i SPS %i PPS %i VPS\n",
            h265_params_info.stdSPSCount, h265_params_info.stdPPSCount,
            h265_params_info.stdVPSCount);
-
-    *buf = tmp;
 
     return 0;
 }
@@ -759,20 +731,18 @@ static int vk_hevc_start_frame(AVCodecContext          *avctx,
 {
     int err;
     HEVCContext *h = avctx->priv_data;
-    HEVCFrame *pic = h->ref;
+    HEVCFrame *pic = h->cur_frame;
     FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
     HEVCVulkanDecodePicture *hp = pic->hwaccel_picture_private;
     FFVulkanDecodePicture *vp = &hp->vp;
-    const HEVCSPS *sps = h->ps.sps;
-    const HEVCPPS *pps = h->ps.pps;
+    const HEVCPPS *pps = h->pps;
+    const HEVCSPS *sps = pps->sps;
     int nb_refs = 0;
 
-    if (!dec->session_params || dec->params_changed) {
-        av_buffer_unref(&dec->session_params);
+    if (!dec->session_params) {
         err = vk_hevc_create_params(avctx, &dec->session_params);
         if (err < 0)
             return err;
-        dec->params_changed = 0;
     }
 
     hp->h265pic = (StdVideoDecodeH265PictureInfo) {
@@ -855,7 +825,6 @@ static int vk_hevc_start_frame(AVCodecContext          *avctx,
         .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PICTURE_INFO_KHR,
         .pStdPictureInfo = &hp->h265pic,
         .sliceSegmentCount = 0,
-        .pSliceSegmentOffsets = vp->slice_off,
     };
 
     vp->decode_info = (VkVideoDecodeInfoKHR) {
@@ -868,7 +837,7 @@ static int vk_hevc_start_frame(AVCodecContext          *avctx,
         .dstPictureResource = (VkVideoPictureResourceInfoKHR) {
             .sType = VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,
             .codedOffset = (VkOffset2D){ 0, 0 },
-            .codedExtent = (VkExtent2D){ pic->frame->width, pic->frame->height },
+            .codedExtent = (VkExtent2D){ pic->f->width, pic->f->height },
             .baseArrayLayer = 0,
             .imageViewBinding = vp->img_view_out,
         },
@@ -882,7 +851,7 @@ static int vk_hevc_decode_slice(AVCodecContext *avctx,
                                 uint32_t        size)
 {
     const HEVCContext *h = avctx->priv_data;
-    HEVCVulkanDecodePicture *hp = h->ref->hwaccel_picture_private;
+    HEVCVulkanDecodePicture *hp = h->cur_frame->hwaccel_picture_private;
     FFVulkanDecodePicture *vp = &hp->vp;
 
     int err = ff_vk_decode_add_slice(avctx, vp, data, size, 1,
@@ -897,41 +866,68 @@ static int vk_hevc_decode_slice(AVCodecContext *avctx,
 static int vk_hevc_end_frame(AVCodecContext *avctx)
 {
     const HEVCContext *h = avctx->priv_data;
-    HEVCFrame *pic = h->ref;
+    FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
+    HEVCFrame *pic = h->cur_frame;
     HEVCVulkanDecodePicture *hp = pic->hwaccel_picture_private;
     FFVulkanDecodePicture *vp = &hp->vp;
     FFVulkanDecodePicture *rvp[HEVC_MAX_REFS] = { 0 };
     AVFrame *rav[HEVC_MAX_REFS] = { 0 };
+    int err;
+
+    if (!hp->h265_pic_info.sliceSegmentCount)
+        return 0;
+
+    if (!dec->session_params) {
+        const HEVCPPS *pps = h->pps;
+        const HEVCSPS *sps = pps->sps;
+
+        if (!pps) {
+            unsigned int pps_id = h->sh.pps_id;
+            if (pps_id < HEVC_MAX_PPS_COUNT && h->ps.pps_list[pps_id] != NULL)
+                pps = h->ps.pps_list[pps_id];
+        }
+
+        if (!pps) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Encountered frame without a valid active PPS reference.\n");
+            return AVERROR_INVALIDDATA;
+        }
+
+        err = vk_hevc_create_params(avctx, &dec->session_params);
+        if (err < 0)
+            return err;
+
+        hp->h265pic.sps_video_parameter_set_id = sps->vps_id;
+        hp->h265pic.pps_seq_parameter_set_id = pps->sps_id;
+        hp->h265pic.pps_pic_parameter_set_id = pps->pps_id;
+    }
 
     for (int i = 0; i < vp->decode_info.referenceSlotCount; i++) {
         HEVCVulkanDecodePicture *rfhp = hp->ref_src[i]->hwaccel_picture_private;
-        rav[i] = hp->ref_src[i]->frame;
+        rav[i] = hp->ref_src[i]->f;
         rvp[i] = &rfhp->vp;
     }
 
     av_log(avctx, AV_LOG_VERBOSE, "Decoding frame, %"SIZE_SPECIFIER" bytes, %i slices\n",
            vp->slices_size, hp->h265_pic_info.sliceSegmentCount);
 
-    return ff_vk_decode_frame(avctx, pic->frame, vp, rav, rvp);
+    return ff_vk_decode_frame(avctx, pic->f, vp, rav, rvp);
 }
 
-static void vk_hevc_free_frame_priv(void *_hwctx, uint8_t *data)
+static void vk_hevc_free_frame_priv(FFRefStructOpaque _hwctx, void *data)
 {
-    AVHWDeviceContext *hwctx = _hwctx;
-    HEVCVulkanDecodePicture *hp = (HEVCVulkanDecodePicture *)data;
+    AVHWDeviceContext *hwctx = _hwctx.nc;
+    HEVCVulkanDecodePicture *hp = data;
 
     /* Free frame resources */
     ff_vk_decode_free_frame(hwctx, &hp->vp);
-
-    /* Free frame context */
-    av_free(hp);
 }
 
-const AVHWAccel ff_hevc_vulkan_hwaccel = {
-    .name                  = "hevc_vulkan",
-    .type                  = AVMEDIA_TYPE_VIDEO,
-    .id                    = AV_CODEC_ID_HEVC,
-    .pix_fmt               = AV_PIX_FMT_VULKAN,
+const FFHWAccel ff_hevc_vulkan_hwaccel = {
+    .p.name                = "hevc_vulkan",
+    .p.type                = AVMEDIA_TYPE_VIDEO,
+    .p.id                  = AV_CODEC_ID_HEVC,
+    .p.pix_fmt             = AV_PIX_FMT_VULKAN,
     .start_frame           = &vk_hevc_start_frame,
     .decode_slice          = &vk_hevc_decode_slice,
     .end_frame             = &vk_hevc_end_frame,
@@ -939,7 +935,7 @@ const AVHWAccel ff_hevc_vulkan_hwaccel = {
     .frame_priv_data_size  = sizeof(HEVCVulkanDecodePicture),
     .init                  = &ff_vk_decode_init,
     .update_thread_context = &ff_vk_update_thread_context,
-    .decode_params         = &ff_vk_params_changed,
+    .decode_params         = &ff_vk_params_invalidate,
     .flush                 = &ff_vk_decode_flush,
     .uninit                = &ff_vk_decode_uninit,
     .frame_params          = &ff_vk_frame_params,
