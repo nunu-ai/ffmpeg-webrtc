@@ -70,7 +70,7 @@ Good luck.
 
 Additional resources and guides:
 - https://trac.ffmpeg.org/wiki/CompilationGuide/MinGW
-- https://docs.nvidia.com/video-technologies/video-codec-sdk/11.1/ffmpeg-with-nvidia-gpu/index.html
+- https://docs.nvidia.com/video-technologies/video-codec-sdk/12.0/ffmpeg-with-nvidia-gpu/index.html
 - https://stackoverflow.com/questions/41870137/ffmpeg-error-libnpp-not-found-in-windows
 
 ## Libraries
