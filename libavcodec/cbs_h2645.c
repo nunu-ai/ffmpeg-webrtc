@@ -573,7 +573,8 @@ static int cbs_h2645_split_fragment(CodedBitstreamContext *ctx,
 
         err = ff_h2645_packet_split(&priv->read_packet,
                                     frag->data + start, end - start,
-                                    ctx->log_ctx, 1, 2, AV_CODEC_ID_H264, 1, 1);
+                                    ctx->log_ctx, 2, AV_CODEC_ID_H264,
+                                    H2645_FLAG_IS_NALFF | H2645_FLAG_SMALL_PADDING | H2645_FLAG_USE_REF);
         if (err < 0) {
             av_log(ctx->log_ctx, AV_LOG_ERROR, "Failed to split AVCC SPS array.\n");
             return err;
@@ -597,7 +598,8 @@ static int cbs_h2645_split_fragment(CodedBitstreamContext *ctx,
 
         err = ff_h2645_packet_split(&priv->read_packet,
                                     frag->data + start, end - start,
-                                    ctx->log_ctx, 1, 2, AV_CODEC_ID_H264, 1, 1);
+                                    ctx->log_ctx, 2, AV_CODEC_ID_H264,
+                                    H2645_FLAG_IS_NALFF | H2645_FLAG_SMALL_PADDING | H2645_FLAG_USE_REF);
         if (err < 0) {
             av_log(ctx->log_ctx, AV_LOG_ERROR, "Failed to split AVCC PPS array.\n");
             return err;
@@ -651,7 +653,8 @@ static int cbs_h2645_split_fragment(CodedBitstreamContext *ctx,
 
             err = ff_h2645_packet_split(&priv->read_packet,
                                         frag->data + start, end - start,
-                                        ctx->log_ctx, 1, 2, AV_CODEC_ID_HEVC, 1, 1);
+                                        ctx->log_ctx, 2, AV_CODEC_ID_HEVC,
+                                        H2645_FLAG_IS_NALFF | H2645_FLAG_SMALL_PADDING | H2645_FLAG_USE_REF);
             if (err < 0) {
                 av_log(ctx->log_ctx, AV_LOG_ERROR, "Failed to split "
                        "HVCC array %d (%d NAL units of type %d).\n",
@@ -721,7 +724,8 @@ static int cbs_h2645_split_fragment(CodedBitstreamContext *ctx,
 
             err = ff_h2645_packet_split(&priv->read_packet,
                                         frag->data + start, end - start,
-                                        ctx->log_ctx, 1, 2, AV_CODEC_ID_VVC, 1, 1);
+                                        ctx->log_ctx, 2, AV_CODEC_ID_VVC,
+                                        H2645_FLAG_IS_NALFF | H2645_FLAG_SMALL_PADDING | H2645_FLAG_USE_REF);
             if (err < 0) {
                 av_log(ctx->log_ctx, AV_LOG_ERROR, "Failed to split "
                        "VVCC array %d (%d NAL units of type %d).\n",
@@ -733,13 +737,14 @@ static int cbs_h2645_split_fragment(CodedBitstreamContext *ctx,
                 return err;
         }
     } else {
+        int flags = (H2645_FLAG_IS_NALFF * !!priv->mp4) | H2645_FLAG_SMALL_PADDING | H2645_FLAG_USE_REF;
         // Annex B, or later MP4 with already-known parameters.
 
         err = ff_h2645_packet_split(&priv->read_packet,
                                     frag->data, frag->data_size,
                                     ctx->log_ctx,
-                                    priv->mp4, priv->nal_length_size,
-                                    codec_id, 1, 1);
+                                    priv->nal_length_size,
+                                    codec_id, flags);
         if (err < 0)
             return err;
 
@@ -1045,6 +1050,14 @@ static int cbs_h265_read_nal_unit(CodedBitstreamContext *ctx,
     case HEVC_NAL_AUD:
         {
             err = cbs_h265_read_aud(ctx, &gbc, unit->content);
+            if (err < 0)
+                return err;
+        }
+        break;
+
+    case HEVC_NAL_FD_NUT:
+        {
+            err = cbs_h265_read_filler(ctx, &gbc, unit->content);
             if (err < 0)
                 return err;
         }
@@ -1487,6 +1500,14 @@ static int cbs_h265_write_nal_unit(CodedBitstreamContext *ctx,
     case HEVC_NAL_AUD:
         {
             err = cbs_h265_write_aud(ctx, pbc, unit->content);
+            if (err < 0)
+                return err;
+        }
+        break;
+
+    case HEVC_NAL_FD_NUT:
+        {
+            err = cbs_h265_write_filler(ctx, pbc, unit->content);
             if (err < 0)
                 return err;
         }
@@ -2001,6 +2022,7 @@ static const CodedBitstreamUnitTypeDescriptor cbs_h265_unit_types[] = {
     CBS_UNIT_TYPE_INTERNAL_REF(HEVC_NAL_PPS, H265RawPPS, extension_data.data),
 
     CBS_UNIT_TYPE_POD(HEVC_NAL_AUD, H265RawAUD),
+    CBS_UNIT_TYPE_POD(HEVC_NAL_FD_NUT, H265RawFiller),
 
     // Slices of non-IRAP pictures.
     CBS_UNIT_RANGE_INTERNAL_REF(HEVC_NAL_TRAIL_N, HEVC_NAL_RASL_R,

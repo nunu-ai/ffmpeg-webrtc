@@ -35,10 +35,11 @@
 #include "libavutil/samplefmt.h"
 #include "libavutil/timestamp.h"
 #include "avfilter.h"
+#include "avfilter_internal.h"
 #include "buffersrc.h"
 #include "filters.h"
 #include "formats.h"
-#include "internal.h"
+#include "video.h"
 
 typedef struct BufferSourceContext {
     const AVClass    *class;
@@ -460,12 +461,17 @@ static int query_formats(AVFilterContext *ctx)
             if ((ret = ff_add_format(&color_spaces, c->color_space)) < 0 ||
                 (ret = ff_set_common_color_spaces(ctx, color_spaces)) < 0)
                 return ret;
-            if ((ret = ff_add_format(&color_ranges, c->color_range)) < 0)
-                return ret;
-            if (c->color_range == AVCOL_RANGE_UNSPECIFIED) {
-                /* allow implicitly promoting unspecified to mpeg */
-                if ((ret = ff_add_format(&color_ranges, AVCOL_RANGE_MPEG)) < 0)
+            if (ff_fmt_is_forced_full_range(swfmt)) {
+                if ((ret = ff_add_format(&color_ranges, AVCOL_RANGE_JPEG)) < 0)
                     return ret;
+            } else {
+                if ((ret = ff_add_format(&color_ranges, c->color_range)) < 0)
+                    return ret;
+                if (c->color_range == AVCOL_RANGE_UNSPECIFIED) {
+                    /* allow implicitly promoting unspecified to mpeg */
+                    if ((ret = ff_add_format(&color_ranges, AVCOL_RANGE_MPEG)) < 0)
+                        return ret;
+                }
             }
             if ((ret = ff_set_common_color_ranges(ctx, color_ranges)) < 0)
                 return ret;
@@ -493,6 +499,7 @@ static int query_formats(AVFilterContext *ctx)
 
 static int config_props(AVFilterLink *link)
 {
+    FilterLink *l = ff_filter_link(link);
     BufferSourceContext *c = link->src->priv;
 
     switch (link->type) {
@@ -502,8 +509,8 @@ static int config_props(AVFilterLink *link)
         link->sample_aspect_ratio = c->pixel_aspect;
 
         if (c->hw_frames_ctx) {
-            link->hw_frames_ctx = av_buffer_ref(c->hw_frames_ctx);
-            if (!link->hw_frames_ctx)
+            l->hw_frames_ctx = av_buffer_ref(c->hw_frames_ctx);
+            if (!l->hw_frames_ctx)
                 return AVERROR(ENOMEM);
         }
         break;
@@ -519,7 +526,7 @@ static int config_props(AVFilterLink *link)
     }
 
     link->time_base = c->time_base;
-    link->frame_rate = c->frame_rate;
+    l->frame_rate = c->frame_rate;
     return 0;
 }
 
